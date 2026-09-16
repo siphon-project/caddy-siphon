@@ -1,0 +1,83 @@
+# Build the caddy-siphon image; smoke-test it on every push/PR, publish to GHCR on a tag.
+#
+# There is no source to compile and no version file — the git tag is the version, extracted by
+# docker/metadata-action. A push/PR builds the image and proves the layer4 app is baked in; a `v*`
+# tag additionally logs in and pushes. Consumers pin the published image by digest.
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/<owner>/<repo> on a tag
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build once, load locally, and prove the plugin is present before anything is pushed. A stock
+      # Caddy would pass every other check but not carry the layer4 app, which is the whole point.
+      - name: Build image (load locally)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: caddy-siphon:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Smoke-test — layer4 app is baked in
+        run: |
+          modules="$(docker run --rm caddy-siphon:ci caddy list-modules)"
+          echo "$modules" | grep -qx 'layer4' || { echo "::error::layer4 app missing from the image"; exit 1; }
+          echo "$modules" | grep -qx 'layer4.handlers.tls' || { echo "::error::layer4 tls handler missing"; exit 1; }
+          echo "$modules" | grep -qx 'layer4.handlers.proxy' || { echo "::error::layer4 proxy handler missing"; exit 1; }
+          echo "$modules" | grep -qx 'layer4.handlers.proxy_protocol' || { echo "::error::layer4 proxy_protocol handler missing"; exit 1; }
+          echo "layer4 app and the tls/proxy/proxy_protocol handlers are present"
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
