@@ -1,0 +1,542 @@
+From fbf163139911f4ad76e46b3921ed55273eaae9a1 Mon Sep 17 00:00:00 2001
+From: killdashnine <674985+killdashnine@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 12:34:22 +0200
+Subject: [PATCH] l4proxy: optionally send the proxy protocol header before the
+ upstream tls handshake
+
+---
+ ...r_proxy_proxyprotocol_before_tls.caddytest |  50 +++
+ modules/l4proxy/proxy.go                      |  88 ++++-
+ modules/l4proxy/proxyprotocol_tls_test.go     | 313 ++++++++++++++++++
+ 3 files changed, 443 insertions(+), 8 deletions(-)
+ create mode 100644 integration/caddyfile_adapt/gd_handler_proxy_proxyprotocol_before_tls.caddytest
+ create mode 100644 modules/l4proxy/proxyprotocol_tls_test.go
+
+diff --git a/integration/caddyfile_adapt/gd_handler_proxy_proxyprotocol_before_tls.caddytest b/integration/caddyfile_adapt/gd_handler_proxy_proxyprotocol_before_tls.caddytest
+new file mode 100644
+index 0000000..fe5b03e
+--- /dev/null
++++ b/integration/caddyfile_adapt/gd_handler_proxy_proxyprotocol_before_tls.caddytest
+@@ -0,0 +1,50 @@
++{
++	layer4 {
++		0.0.0.0:5061 {
++			route {
++				proxy {
++					proxy_protocol v2 before_tls
++					upstream 10.0.0.1:5061 {
++						tls
++						tls_insecure_skip_verify
++					}
++				}
++			}
++		}
++	}
++}
++----------
++{
++	"apps": {
++		"layer4": {
++			"servers": {
++				"srv0": {
++					"listen": [
++						"0.0.0.0:5061"
++					],
++					"routes": [
++						{
++							"handle": [
++								{
++									"handler": "proxy",
++									"proxy_protocol": "v2",
++									"proxy_protocol_before_tls": true,
++									"upstreams": [
++										{
++											"dial": [
++												"10.0.0.1:5061"
++											],
++											"tls": {
++												"insecure_skip_verify": true
++											}
++										}
++									]
++								}
++							]
++						}
++					]
++				}
++			}
++		}
++	}
++}
+diff --git a/modules/l4proxy/proxy.go b/modules/l4proxy/proxy.go
+index 994e65c..24cdd5d 100644
+--- a/modules/l4proxy/proxy.go
++++ b/modules/l4proxy/proxy.go
+@@ -60,6 +60,16 @@ type Handler struct {
+ 	// Ref: https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+ 	ProxyProtocol string `json:"proxy_protocol,omitempty"`
+ 
++	// For upstreams that use TLS, send the PROXY protocol header on the raw TCP
++	// connection before the TLS handshake instead of inside the TLS session.
++	// Before the handshake is where the specification puts it ("immediately after
++	// the connection establishment", ahead of any other data), and where HAProxy
++	// `send-proxy-v2 ssl` and nginx `proxy_protocol on` with `proxy_ssl on` send it,
++	// so it is what a TLS server that implements the protocol expects to read.
++	// Off by default to keep the existing placement for backends that want the
++	// header inside the session. Requires proxy_protocol.
++	ProxyProtocolBeforeTLS bool `json:"proxy_protocol_before_tls,omitempty"`
++
+ 	proxyProtocolVersion uint8
+ 
+ 	metrics *proxyMetrics
+@@ -100,6 +110,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
+ 	} else if proxyProtocol != "" {
+ 		return fmt.Errorf("proxy_protocol: \"%s\" should be empty, or one of \"v1\" \"v2\"", proxyProtocol)
+ 	}
++	if h.ProxyProtocolBeforeTLS && h.proxyProtocolVersion == 0 {
++		return fmt.Errorf("proxy_protocol_before_tls requires proxy_protocol")
++	}
+ 
+ 	// prepare upstreams
+ 	if len(h.Upstreams) == 0 {
+@@ -247,6 +260,7 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
+ 	for _, p := range upstream.peers {
+ 		var up net.Conn
+ 		var err error
++		var headerSent bool
+ 
+ 		// For dynamic dial addresses (with runtime placeholders) the address was
+ 		// not pre-parsed at provision; resolve it per-connection here.
+@@ -319,21 +333,24 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
+ 				newTLSCfg.ServerName = valServerName
+ 				tlsCfg = newTLSCfg
+ 			}
+-			up, err = tlsDialWithLocalAddrs(localAddrs, dialNetwork, hostPort, tlsCfg)
++			if h.proxyProtocolVersion > 0 && h.ProxyProtocolBeforeTLS {
++				up, err = tlsDialAfterProxyHeader(localAddrs, dialNetwork, hostPort, tlsCfg, h.proxyProtocolHeader(down))
++				headerSent = true
++			} else {
++				up, err = tlsDialWithLocalAddrs(localAddrs, dialNetwork, hostPort, tlsCfg)
++			}
+ 		}
+ 		h.logger.Debug("dial upstream",
+ 			zap.String("remote", down.RemoteAddr().String()),
+ 			zap.String("upstream", hostPort),
+ 			zap.Error(err))
+ 
+-		// Send the PROXY protocol header.
+-		if err == nil && h.proxyProtocolVersion > 0 {
+-			downConn := l4proxyprotocol.GetConn(down)
+-			header := proxyproto.HeaderProxyFromAddrs(h.proxyProtocolVersion, downConn.RemoteAddr(), downConn.LocalAddr())
++		// Send the PROXY protocol header, unless it already went ahead of the TLS handshake.
++		if err == nil && h.proxyProtocolVersion > 0 && !headerSent {
++			header := h.proxyProtocolHeader(down)
+ 
+ 			// Only write the PROXY protocol header if it's not nil
+ 			if header != nil {
+-				header.Command = proxyproto.PROXY
+ 				// for packet connection, prepend each message with pp
+ 				// unix connections always implement this interface while not necessarily in datagram mode
+ 				// ignore it unless the unix socket is in datagram mode
+@@ -526,7 +543,7 @@ func (h *Handler) Cleanup() error {
+ //		lb_try_duration <duration>
+ //		lb_try_interval <duration>
+ //
+-//		proxy_protocol <v1|v2>
++//		proxy_protocol <v1|v2> [before_tls]
+ //
+ //		# multiple upstream options are supported
+ //		upstream [<args...>] {
+@@ -772,7 +789,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 			if hasProxyProtocol {
+ 				return d.Errf("duplicate %s option '%s'", wrapper, optionName)
+ 			}
+-			_, h.ProxyProtocol, hasProxyProtocol = d.NextArg(), d.Val(), true
++			if !d.NextArg() {
++				return d.ArgErr()
++			}
++			h.ProxyProtocol, hasProxyProtocol = d.Val(), true
++			if d.NextArg() {
++				if d.Val() != "before_tls" {
++					return d.Errf("parsing %s option '%s': unknown placement '%s', expected 'before_tls'", wrapper, optionName, d.Val())
++				}
++				h.ProxyProtocolBeforeTLS = true
++			}
++			if d.NextArg() {
++				return d.ArgErr()
++			}
+ 		case "upstream":
+ 			u := &Upstream{}
+ 			if err := u.UnmarshalCaddyfile(d.NewFromNextSegment()); err != nil {
+@@ -1015,6 +1044,49 @@ func dialWithLocalAddrs(localAddrs []net.Addr, network, addr string) (net.Conn,
+ 	return nil, lastErr
+ }
+ 
++// proxyProtocolHeader returns the PROXY protocol header describing the downstream
++// connection, or nil if there is none to send.
++func (h *Handler) proxyProtocolHeader(down *layer4.Connection) *proxyproto.Header {
++	downConn := l4proxyprotocol.GetConn(down)
++	header := proxyproto.HeaderProxyFromAddrs(h.proxyProtocolVersion, downConn.RemoteAddr(), downConn.LocalAddr())
++	if header != nil {
++		header.Command = proxyproto.PROXY
++	}
++	return header
++}
++
++// tlsDialAfterProxyHeader dials the upstream in plaintext, writes the PROXY protocol
++// header to the raw connection, then runs the TLS client handshake on that same
++// connection, so the header precedes the ClientHello as the specification requires.
++func tlsDialAfterProxyHeader(localAddrs []net.Addr, network, addr string, cfg *tls.Config, header *proxyproto.Header) (net.Conn, error) {
++	raw, err := dialWithLocalAddrs(localAddrs, network, addr)
++	if err != nil {
++		return nil, err
++	}
++	if header != nil {
++		if _, err := header.WriteTo(raw); err != nil {
++			_ = raw.Close()
++			return nil, err
++		}
++	}
++	// As tls.Dial does, verify against the dialled host unless a server name is set.
++	if cfg.ServerName == "" {
++		host, _, err := net.SplitHostPort(addr)
++		if err != nil {
++			_ = raw.Close()
++			return nil, err
++		}
++		cfg = cfg.Clone()
++		cfg.ServerName = host
++	}
++	conn := tls.Client(raw, cfg)
++	if err := conn.Handshake(); err != nil {
++		_ = raw.Close()
++		return nil, err
++	}
++	return conn, nil
++}
++
+ func tlsDialWithLocalAddrs(localAddrs []net.Addr, network, addr string, cfg *tls.Config) (net.Conn, error) {
+ 	if len(localAddrs) == 0 {
+ 		return tls.Dial(network, addr, cfg)
+diff --git a/modules/l4proxy/proxyprotocol_tls_test.go b/modules/l4proxy/proxyprotocol_tls_test.go
+new file mode 100644
+index 0000000..365b104
+--- /dev/null
++++ b/modules/l4proxy/proxyprotocol_tls_test.go
+@@ -0,0 +1,313 @@
++package l4proxy
++
++import (
++	"bytes"
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/binary"
++	"io"
++	"math/big"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/caddyserver/caddy/v2"
++	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
++	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
++	"github.com/mholt/caddy-l4/layer4"
++	"go.uber.org/zap"
++)
++
++// proxyV2Signature is the 12-byte PROXY protocol v2 signature, section 2.2 of
++// https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt.
++var proxyV2Signature = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
++
++// expectedProxyV2TCP4 builds the v2 header for a TCP over IPv4 connection by hand from
++// the specification, independently of the go-proxyproto encoder under test:
++// signature, 0x21 (version 2, PROXY), 0x11 (AF_INET, STREAM), length 12, then
++// source address, destination address, source port, destination port.
++func expectedProxyV2TCP4(t *testing.T, source, destination *net.TCPAddr) []byte {
++	t.Helper()
++	header := append([]byte{}, proxyV2Signature...)
++	header = append(header, 0x21, 0x11, 0x00, 0x0C)
++	header = append(header, source.IP.To4()...)
++	header = append(header, destination.IP.To4()...)
++	header = binary.BigEndian.AppendUint16(header, uint16(source.Port))
++	header = binary.BigEndian.AppendUint16(header, uint16(destination.Port))
++	return header
++}
++
++func selfSignedCertificate(t *testing.T) tls.Certificate {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatalf("generating key: %v", err)
++	}
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		Subject:      pkix.Name{CommonName: "upstream.test"},
++		DNSNames:     []string{"upstream.test"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
++	if err != nil {
++		t.Fatalf("creating certificate: %v", err)
++	}
++	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
++}
++
++// tcpDownstream returns a layer4 connection wrapping the server side of a real
++// loopback TCP connection, so the PROXY header carries TCP addresses.
++func tcpDownstream(t *testing.T, logger *zap.Logger) (*layer4.Connection, net.Conn) {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listening for downstream: %v", err)
++	}
++	defer ln.Close()
++	client, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatalf("dialing downstream: %v", err)
++	}
++	t.Cleanup(func() { client.Close() })
++	server, err := ln.Accept()
++	if err != nil {
++		t.Fatalf("accepting downstream: %v", err)
++	}
++	t.Cleanup(func() { server.Close() })
++	return layer4.WrapConnection(server, nil, logger), client
++}
++
++type upstreamResult struct {
++	firstBytes []byte
++	payload    []byte
++	err        error
++}
++
++// runTLSUpstream accepts one connection, reads headerLength raw bytes off the TCP
++// stream before anything else, then runs a TLS server handshake on the remainder
++// and reads a 4-byte payload from inside the session.
++func runTLSUpstream(t *testing.T, ln net.Listener, headerLength int) <-chan upstreamResult {
++	t.Helper()
++	certificate := selfSignedCertificate(t)
++	results := make(chan upstreamResult, 1)
++	go func() {
++		var result upstreamResult
++		defer func() { results <- result }()
++		conn, err := ln.Accept()
++		if err != nil {
++			result.err = err
++			return
++		}
++		defer conn.Close()
++		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++		result.firstBytes = make([]byte, headerLength)
++		if _, err := io.ReadFull(conn, result.firstBytes); err != nil {
++			result.err = err
++			return
++		}
++		if result.firstBytes[0] == 0x16 {
++			// A TLS record where the header should be; nothing more to learn.
++			return
++		}
++		session := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
++		result.payload = make([]byte, 4)
++		if _, err := io.ReadFull(session, result.payload); err != nil {
++			result.err = err
++		}
++	}()
++	return results
++}
++
++func tlsProxyProtocolHandler(t *testing.T, ln net.Listener, beforeTLS bool) (*Handler, *Upstream) {
++	t.Helper()
++	parsed, err := caddy.ParseNetworkAddress(ln.Addr().String())
++	if err != nil {
++		t.Fatalf("parsing upstream address: %v", err)
++	}
++	h := &Handler{
++		logger:                 zap.NewNop(),
++		ProxyProtocol:          "v2",
++		proxyProtocolVersion:   2,
++		ProxyProtocolBeforeTLS: beforeTLS,
++	}
++	upstream := &Upstream{
++		TLS:       &reverseproxy.TLSConfig{InsecureSkipVerify: true},
++		tlsConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "upstream.test"},
++		peers:     []*peer{{address: &parsed}},
++	}
++	return h, upstream
++}
++
++// With before_tls, the PROXY header is the first thing on the upstream TCP stream,
++// in cleartext, and the TLS handshake follows it on the same connection.
++func TestDialPeersWritesProxyHeaderBeforeTLSHandshake(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listening for upstream: %v", err)
++	}
++	defer ln.Close()
++
++	h, upstream := tlsProxyProtocolHandler(t, ln, true)
++	down, _ := tcpDownstream(t, h.logger)
++	want := expectedProxyV2TCP4(t, down.RemoteAddr().(*net.TCPAddr), down.LocalAddr().(*net.TCPAddr))
++	results := runTLSUpstream(t, ln, len(want))
++
++	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
++	upConns, err := h.dialPeers(upstream, repl, down)
++	if err != nil {
++		t.Fatalf("dialPeers: %v", err)
++	}
++	defer upConns[0].Close()
++	if _, ok := upConns[0].(*tls.Conn); !ok {
++		t.Fatalf("upstream connection is %T, want *tls.Conn", upConns[0])
++	}
++	if _, err := upConns[0].Write([]byte("ping")); err != nil {
++		t.Fatalf("writing inside the upstream TLS session: %v", err)
++	}
++
++	result := <-results
++	if result.err != nil {
++		t.Fatalf("upstream: %v (first bytes % x)", result.err, result.firstBytes)
++	}
++	if !bytes.Equal(result.firstBytes, want) {
++		t.Fatalf("first bytes on the upstream stream:\n got % x\nwant % x", result.firstBytes, want)
++	}
++	if string(result.payload) != "ping" {
++		t.Fatalf("payload inside the TLS session = %q, want %q", result.payload, "ping")
++	}
++}
++
++// Without before_tls, the existing placement is kept: the handshake comes first
++// and the header travels inside the TLS session.
++func TestDialPeersKeepsProxyHeaderInsideTLSByDefault(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listening for upstream: %v", err)
++	}
++	defer ln.Close()
++
++	h, upstream := tlsProxyProtocolHandler(t, ln, false)
++	down, _ := tcpDownstream(t, h.logger)
++	results := runTLSUpstream(t, ln, len(proxyV2Signature))
++
++	// The default path completes the handshake inside dialPeers, which this
++	// upstream never answers, so give it a deadline through the result instead.
++	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
++	dialed := make(chan error, 1)
++	go func() {
++		upConns, err := h.dialPeers(upstream, repl, down)
++		for _, c := range upConns {
++			c.Close()
++		}
++		dialed <- err
++	}()
++
++	result := <-results
++	if result.err != nil {
++		t.Fatalf("upstream: %v", result.err)
++	}
++	if result.firstBytes[0] != 0x16 {
++		t.Fatalf("first byte on the upstream stream = %#x, want 0x16 (TLS handshake record)", result.firstBytes[0])
++	}
++	select {
++	case <-dialed:
++	case <-time.After(5 * time.Second):
++		t.Fatal("dialPeers did not return after the upstream closed")
++	}
++}
++
++// When the handshake after the header fails, dialPeers reports the error and
++// does not leak the raw connection.
++func TestDialPeersBeforeTLSReportsHandshakeFailure(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("listening for upstream: %v", err)
++	}
++	defer ln.Close()
++
++	h, upstream := tlsProxyProtocolHandler(t, ln, true)
++	down, _ := tcpDownstream(t, h.logger)
++	closed := make(chan error, 1)
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			closed <- err
++			return
++		}
++		// Read the header and the ClientHello, then hang up without answering.
++		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++		_, _ = conn.Read(make([]byte, 4096))
++		conn.Close()
++		closed <- nil
++	}()
++
++	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
++	upConns, err := h.dialPeers(upstream, repl, down)
++	if err == nil {
++		for _, c := range upConns {
++			c.Close()
++		}
++		t.Fatal("dialPeers succeeded against an upstream that never completed the handshake")
++	}
++	if len(upConns) != 0 {
++		t.Fatalf("dialPeers returned %d connections alongside an error", len(upConns))
++	}
++	if err := <-closed; err != nil {
++		t.Fatalf("upstream: %v", err)
++	}
++}
++
++func TestProvisionRejectsBeforeTLSWithoutProxyProtocol(t *testing.T) {
++	h := &Handler{
++		ProxyProtocolBeforeTLS: true,
++		Upstreams:              UpstreamPool{{Dial: []string{"127.0.0.1:1"}}},
++	}
++	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
++	defer cancel()
++	if err := h.Provision(ctx); err == nil {
++		t.Fatal("expected an error for proxy_protocol_before_tls without proxy_protocol")
++	}
++}
++
++func TestUnmarshalCaddyfileProxyProtocolBeforeTLS(t *testing.T) {
++	h := new(Handler)
++	input := "proxy localhost:1 {\n\tproxy_protocol v2 before_tls\n}"
++	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
++		t.Fatalf("parsing %q: %v", input, err)
++	}
++	if h.ProxyProtocol != "v2" || !h.ProxyProtocolBeforeTLS {
++		t.Fatalf("got proxy_protocol %q before_tls %v, want \"v2\" true", h.ProxyProtocol, h.ProxyProtocolBeforeTLS)
++	}
++
++	h = new(Handler)
++	input = "proxy localhost:1 {\n\tproxy_protocol v2\n}"
++	if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
++		t.Fatalf("parsing %q: %v", input, err)
++	}
++	if h.ProxyProtocolBeforeTLS {
++		t.Fatal("before_tls set without being asked for")
++	}
++}
++
++func TestUnmarshalCaddyfileProxyProtocolErrors(t *testing.T) {
++	cases := map[string]string{
++		"unknown placement": "proxy localhost:1 {\n\tproxy_protocol v2 after_tls\n}",
++		"too many args":     "proxy localhost:1 {\n\tproxy_protocol v2 before_tls extra\n}",
++		"no version":        "proxy localhost:1 {\n\tproxy_protocol\n}",
++	}
++	for name, input := range cases {
++		t.Run(name, func(t *testing.T) {
++			h := new(Handler)
++			if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err == nil {
++				t.Fatalf("expected an error for %q, got nil", name)
++			}
++		})
++	}
++}
+-- 
+2.53.0
+

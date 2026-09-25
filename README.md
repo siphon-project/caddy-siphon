@@ -17,6 +17,32 @@ Both are pinned in the [`Dockerfile`](./Dockerfile), and bumped deliberately:
 - **caddy-l4** — the module version. It is pre-1.0 and warns of breaking changes between versions, so
   the config is re-checked on every bump.
 
+## Patches
+
+caddy-l4 is built from source at the pinned tag (checked against its commit) with the patches in
+[`patches/`](./patches) applied. The patched module's tests run during the image build.
+
+- **`caddy-l4-proxy-protocol-before-tls.patch`**: adds `proxy_protocol <v1|v2> before_tls`
+  (JSON `"proxy_protocol_before_tls": true`) to the layer4 `proxy` handler. Upstream caddy-l4 dials
+  a `tls` upstream, completes the handshake, and only then writes the PROXY header, so the header
+  travels inside the TLS session. The PROXY protocol specification puts it first on the connection,
+  ahead of any other data, and that is where HAProxy (`send-proxy-v2` with `ssl`) and nginx
+  (`proxy_protocol on` with `proxy_ssl on`) send it; a server that reads the header before its TLS
+  handshake sees a ClientHello instead. With `before_tls` the handler dials plaintext, writes the
+  header, then runs the TLS handshake on the same connection. Without it the existing placement is
+  unchanged. Based on caddy-l4 `v0.1.2` (`42db569`).
+
+```
+proxy {
+	proxy_protocol v2 before_tls
+	upstream 192.0.2.10:5061 {
+		tls
+	}
+}
+```
+
+When bumping caddy-l4, re-check each patch: drop it if upstream has the fix, otherwise rebase it.
+
 ## Image
 
 Published to `ghcr.io/siphon-project/caddy-siphon`, built and pushed by CI on a tag. Consumers pin it
