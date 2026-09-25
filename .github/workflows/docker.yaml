@@ -51,6 +51,14 @@ jobs:
           echo "$modules" | grep -qx 'layer4.handlers.proxy_protocol' || { echo "::error::layer4 proxy_protocol handler missing"; exit 1; }
           echo "layer4 app and the tls/proxy/proxy_protocol handlers are present"
 
+      # An unpatched caddy-l4 has every module above, so check the patch itself made it in.
+      - name: Smoke-test — proxy_protocol before_tls patch is applied
+        run: |
+          printf '{\n\tlayer4 {\n\t\t:5061 {\n\t\t\troute {\n\t\t\t\tproxy {\n\t\t\t\t\tproxy_protocol v2 before_tls\n\t\t\t\t\tupstream 192.0.2.1:5061 {\n\t\t\t\t\t\ttls\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n' > Caddyfile.smoke
+          adapted="$(docker run --rm -v "$PWD/Caddyfile.smoke:/etc/caddy/Caddyfile:ro" caddy-siphon:ci caddy adapt --config /etc/caddy/Caddyfile)"
+          echo "$adapted" | grep -q '"proxy_protocol_before_tls":true' || { echo "::error::proxy_protocol before_tls patch missing"; echo "$adapted"; exit 1; }
+          echo "proxy_protocol before_tls is supported"
+
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v4
