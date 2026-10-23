@@ -6,16 +6,33 @@ for the SIPhon stack.
 Stock Caddy fronts the web UI over HTTPS. The SIPhon stack also needs it to front **SIP over TLS**:
 the layer4 app terminates TLS on a SIP port and proxies the decrypted stream to the SIP server as
 plain TCP, reusing the same on-demand, per-SNI certificate automation Caddy already runs for HTTPS.
-Stock Caddy has no layer4 app, so this image adds `github.com/mholt/caddy-l4` with `xcaddy`. Nothing
-else changes: it is stock Caddy with one extra app.
+Stock Caddy has no layer4 app, so this image adds `github.com/mholt/caddy-l4` with `xcaddy`.
+
+It also carries two DNS providers, for ACME DNS-01 challenges (the only way to get a wildcard
+certificate), and a rate limiting HTTP handler. Nothing else changes: it is stock Caddy with these
+modules added.
 
 ## Versions
 
-Both are pinned in the [`Dockerfile`](./Dockerfile), and bumped deliberately:
+All are pinned in the [`Dockerfile`](./Dockerfile), and bumped deliberately:
 
-- **Caddy** — the `caddy:<version>-builder` and runtime image tags.
-- **caddy-l4** — the module version. It is pre-1.0 and warns of breaking changes between versions, so
-  the config is re-checked on every bump.
+| Component | Module | Pin | Commit |
+|---|---|---|---|
+| Caddy | `caddy:<version>-builder` and runtime image tags | `2.11.4` | |
+| [caddy-l4](https://github.com/mholt/caddy-l4) | `layer4` | `v0.1.2`, patched | `42db569` |
+| [caddy-dns/route53](https://github.com/caddy-dns/route53) | `dns.providers.route53` | `v1.6.2` | `0b76c51` |
+| [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare) | `dns.providers.cloudflare` | `v0.2.4` | `a8737d0` |
+| [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) | `http.handlers.rate_limit` | `v0.1.1-0.20260612195517-5625512f24f6` | `5625512` |
+
+The build checks each module version against its commit (`Origin.Hash` from `go mod download -json`
+for the three proxy-fetched modules), so a moved tag fails the build. caddy-l4 is pre-1.0 and warns of
+breaking changes between versions, so the config is re-checked on every bump.
+
+**caddy-ratelimit is pinned by commit, not by tag.** Its only tag, `v0.1.0` (August 2024), predates
+its metrics, the subnet keys (`ipv4_prefix` / `ipv6_prefix`) and the refusal of unknown Caddyfile
+subdirectives. The pinned commit is the fix that re-registers its metrics collectors on each config
+reload; the commit before it adds metrics without that fix. Move to a tag once upstream cuts one at or
+after `5625512`.
 
 ## Patches
 
@@ -52,10 +69,15 @@ by digest.
 
 ```
 docker build --tag caddy-siphon .
-docker run --rm caddy-siphon caddy list-modules | grep layer4
+docker run --rm caddy-siphon caddy list-modules | grep -E 'layer4|dns.providers|rate_limit'
+docker run --rm -v "$PWD/smoke/modules.Caddyfile:/etc/caddy/Caddyfile:ro" caddy-siphon \
+	caddy adapt --config /etc/caddy/Caddyfile
 ```
 
-The second command should list the `layer4.*` modules, confirming the plugin is present.
+The second command should list the `layer4.*` modules, `dns.providers.route53`,
+`dns.providers.cloudflare` and `http.handlers.rate_limit`. The third adapts
+[`smoke/modules.Caddyfile`](./smoke/modules.Caddyfile), which uses both DNS providers and a rate limit
+zone; CI runs both checks.
 
 ## Usage
 

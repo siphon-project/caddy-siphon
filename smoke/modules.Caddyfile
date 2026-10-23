@@ -1,0 +1,28 @@
+# Smoke test for the DNS provider and rate limit modules: `caddy adapt` must parse every directive
+# below. Adapting provisions nothing, so no credentials are needed. The cloudflare token is fake but
+# has a valid format (the module checks it at provision time, and its error message echoes it).
+
+a.example.com {
+	tls {
+		dns route53 {
+			region eu-central-1
+		}
+	}
+	route {
+		rate_limit {
+			zone z {
+				key {remote_host}
+				events 10
+				window 1m
+			}
+		}
+		respond "ok"
+	}
+}
+
+b.example.com {
+	tls {
+		dns cloudflare not-a-real-token-smoke-test-only-000000
+	}
+	respond "ok"
+}
