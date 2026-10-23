@@ -20,6 +20,59 @@ permissions:
   contents: read
 
 jobs:
+  # The storage module's own tests, against a real PostgreSQL. POSTGRES_STORAGE_TEST_REQUIRED makes a
+  # missing database fail the job instead of skipping every test and passing having checked nothing.
+  postgres-storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: caddy
+          POSTGRES_PASSWORD: caddy
+          POSTGRES_DB: caddy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U caddy -d caddy"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    defaults:
+      run:
+        working-directory: modules/postgresstorage
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: modules/postgresstorage/go.mod
+          cache-dependency-path: modules/postgresstorage/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::not gofmt-formatted: $unformatted"; exit 1; }
+
+      - name: go mod verify and vet
+        run: |
+          go mod verify
+          go vet ./...
+
+      - name: go test (with PostgreSQL)
+        env:
+          POSTGRES_STORAGE_TEST_DSN: postgres://caddy:caddy@127.0.0.1:5432/caddy?sslmode=disable
+          POSTGRES_STORAGE_TEST_REQUIRED: "1"
+        run: |
+          go test -race -count=1 -v ./... | tee test.log
+          status="${PIPESTATUS[0]}"
+          passed="$(grep -c -- '--- PASS' test.log || true)"
+          skipped="$(grep -c -- '--- SKIP' test.log || true)"
+          echo "passed=$passed skipped=$skipped"
+          [ "$status" -eq 0 ] || exit "$status"
+          [ "$skipped" -eq 0 ] || { echo "::error::$skipped tests skipped"; exit 1; }
+          [ "$passed" -gt 0 ] || { echo "::error::no tests ran"; exit 1; }
+
   image:
     runs-on: ubuntu-latest
     permissions:
@@ -54,6 +107,8 @@ jobs:
           echo "$modules" | grep -qx 'dns.providers.cloudflare' || { echo "::error::cloudflare DNS provider missing"; exit 1; }
           echo "$modules" | grep -qx 'http.handlers.rate_limit' || { echo "::error::rate_limit handler missing"; exit 1; }
           echo "route53 and cloudflare DNS providers and the rate_limit handler are present"
+          echo "$modules" | grep -qx 'caddy.storage.postgresql' || { echo "::error::postgresql storage module missing"; exit 1; }
+          echo "the postgresql storage module is present"
 
       # An unpatched caddy-l4 has every module above, so check the patch itself made it in.
       - name: Smoke-test — proxy_protocol before_tls patch is applied
@@ -65,13 +120,19 @@ jobs:
 
       # Listing a module proves it is linked in; adapting a config proves its Caddyfile syntax parses
       # into the JSON we expect. Adapting provisions nothing, so no DNS credentials are involved.
-      - name: Smoke-test — DNS providers and rate_limit adapt from a Caddyfile
+      - name: Smoke-test — DNS providers, rate_limit and postgresql storage adapt from a Caddyfile
         run: |
           adapted="$(docker run --rm -v "$PWD/smoke/modules.Caddyfile:/etc/caddy/Caddyfile:ro" caddy-siphon:ci caddy adapt --config /etc/caddy/Caddyfile)"
-          for want in '"name":"route53"' '"region":"eu-central-1"' '"name":"cloudflare"' '"handler":"rate_limit"' '"max_events":10'; do
+          for want in '"name":"route53"' '"region":"eu-central-1"' '"name":"cloudflare"' '"handler":"rate_limit"' '"max_events":10' \
+            '"storage":{"dsn":"{env.CADDY_STORAGE_DSN}","lock_ttl":30000000000,"module":"postgresql","table_prefix":"caddy_"}'; do
             echo "$adapted" | grep -qF "$want" || { echo "::error::adapted config lacks $want"; echo "$adapted"; exit 1; }
           done
-          echo "route53, cloudflare and rate_limit adapt as expected"
+          echo "route53, cloudflare, rate_limit and postgresql storage adapt as expected"
+
+      # Adapting proves the syntax; running proves the module provisions and certmagic works on it:
+      # two Caddy nodes on one PostgreSQL, the first issues a certificate, the second uses it.
+      - name: Smoke-test — two nodes share one PostgreSQL storage
+        run: smoke/postgres-storage.sh caddy-siphon:ci
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/v')

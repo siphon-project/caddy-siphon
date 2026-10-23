@@ -1,6 +1,16 @@
-# Smoke test for the DNS provider and rate limit modules: `caddy adapt` must parse every directive
-# below. Adapting provisions nothing, so no credentials are needed. The cloudflare token is fake but
-# has a valid format (the module checks it at provision time, and its error message echoes it).
+# Smoke test for the DNS provider, rate limit and PostgreSQL storage modules: `caddy adapt` must parse
+# every directive below. Adapting provisions nothing, so no credentials or database are needed. The
+# cloudflare token is fake but has a valid format (the module checks it at provision time, and its
+# error message echoes it). The storage DSN stays a `{env.*}` placeholder in the adapted JSON, which
+# is what keeps the secret out of autosave.json.
+
+{
+	storage postgresql {
+		dsn "{env.CADDY_STORAGE_DSN}"
+		table_prefix caddy_
+		lock_ttl 30s
+	}
+}
 
 a.example.com {
 	tls {

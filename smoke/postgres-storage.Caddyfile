@@ -1,0 +1,14 @@
+# Run-time smoke test for the PostgreSQL storage module, used by smoke/postgres-storage.sh: Caddy
+# starts with its state in PostgreSQL and issues a certificate from its internal CA into it.
+
+{
+	storage postgresql {
+		dsn "{env.CADDY_STORAGE_DSN}"
+	}
+	skip_install_trust
+}
+
+a.test {
+	tls internal
+	respond "ok"
+}
