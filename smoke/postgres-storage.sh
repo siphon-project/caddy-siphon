@@ -57,7 +57,9 @@ docker network create "$name" >/dev/null
 docker run -d --name "${name}-db" --network "$name" \
 	-e POSTGRES_USER=caddy -e POSTGRES_PASSWORD="$password" -e POSTGRES_DB=caddy \
 	postgres:17-alpine >/dev/null
-wait_for "PostgreSQL" 60 docker exec "${name}-db" pg_isready -U caddy -d caddy -q
+# Over TCP, not the socket: the entrypoint's init runs a temporary socket-only server and then restarts,
+# so a socket check passes during init and node 1 would connect into the restart (SQLSTATE 57P03).
+wait_for "PostgreSQL" 60 docker exec "${name}-db" pg_isready -h 127.0.0.1 -U caddy -d caddy -q
 
 start_node() {
 	docker run -d --name "${name}-$1" --network "$name" \
